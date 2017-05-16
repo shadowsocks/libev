@@ -365,7 +365,7 @@
 # define EV_HEAP_CACHE_AT EV_FEATURE_DATA
 #endif
 
-#ifdef ANDROID
+#ifdef __ANDROID__
 /* supposedly, android doesn't typedef fd_mask */
 # undef EV_USE_SELECT
 # define EV_USE_SELECT 0
@@ -4402,9 +4402,11 @@ inline_size int
 infy_newfd (void)
 {
 #if defined IN_CLOEXEC && defined IN_NONBLOCK
+#if !defined __ANDROID__ || __ANDROID_API__ >= 21
   int fd = inotify_init1 (IN_CLOEXEC | IN_NONBLOCK);
   if (fd >= 0)
     return fd;
+#endif
 #endif
   return inotify_init ();
 }

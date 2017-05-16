@@ -240,9 +240,11 @@ int
 epoll_init (EV_P_ int flags)
 {
 #ifdef EPOLL_CLOEXEC
+#if !defined __ANDROID__ || __ANDROID_API__ >= 21
   backend_fd = epoll_create1 (EPOLL_CLOEXEC);
 
   if (backend_fd < 0 && (errno == EINVAL || errno == ENOSYS))
+#endif
 #endif
     backend_fd = epoll_create (256);
 
