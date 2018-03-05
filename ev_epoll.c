@@ -64,7 +64,7 @@
  */
 
 #ifdef _WIN32
-#include <wepoll.h>
+#include "wepoll.h"
 #else
 #include <sys/epoll.h>
 #endif
