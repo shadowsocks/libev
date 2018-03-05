@@ -300,7 +300,7 @@
 #endif
 
 #ifndef EV_USE_EPOLL
-# if __linux && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 4)) || defined _WIN32
+# if __linux && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 4))
 #  define EV_USE_EPOLL EV_FEATURE_BACKENDS
 # else
 #  define EV_USE_EPOLL 0
