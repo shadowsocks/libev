@@ -33,6 +33,7 @@
 #define WEPOLL_EXPORT
 #endif
 
+#include <malloc.h>
 #include <stdint.h>
 
 /* clang-format off */
@@ -515,6 +516,39 @@ static ssize_t _afd_get_protocol_info(SOCKET socket,
                  (char*) protocol_info,
                  &opt_len) != 0)
     return_error(-1);
+
+  /* If the socket is controlled by a layered service provider, seek to the
+   * protocol at the end of the protocol chain. */
+  if (protocol_info->ProtocolChain.ChainLen > 0) {
+    DWORD catalog_id =
+        protocol_info->ProtocolChain
+            .ChainEntries[protocol_info->ProtocolChain.ChainLen - 1];
+    DWORD buffer_size = 0;
+    int i, r;
+    WSAPROTOCOL_INFOW* prots;
+
+    r = WSAEnumProtocolsW(NULL, NULL, &buffer_size);
+    if (r == SOCKET_ERROR && WSAGetLastError() != WSAENOBUFS)
+      return_error(-1);
+
+    prots = malloc(buffer_size);
+    if (prots == NULL)
+      return_error(-1, ERROR_NOT_ENOUGH_MEMORY);
+    memset(prots, 0, buffer_size);
+
+    r = WSAEnumProtocolsW(NULL, prots, &buffer_size);
+    if (r == SOCKET_ERROR)
+      return_error(-1);
+
+    for (i = 0; i < r; i++) {
+      WSAPROTOCOL_INFOW* p = &prots[i];
+      if (p->dwCatalogEntryId == catalog_id) {
+        *protocol_info = *p;
+      }
+    }
+
+    free(prots);
+  }
 
   id = -1;
   for (i = 0; i < array_count(AFD_PROVIDER_GUID_LIST); i++) {
