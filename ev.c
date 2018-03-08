@@ -108,7 +108,7 @@
 #  define EV_USE_POLL 0
 # endif
    
-# if HAVE_EPOLL_CTL && HAVE_SYS_EPOLL_H
+# if (HAVE_EPOLL_CTL && HAVE_SYS_EPOLL_H) || defined _WIN32
 #  ifndef EV_USE_EPOLL
 #   define EV_USE_EPOLL EV_FEATURE_BACKENDS
 #  endif
@@ -206,7 +206,7 @@
 # include <winsock2.h>
 # include <windows.h>
 # ifndef EV_SELECT_IS_WINSOCKET
-#  define EV_SELECT_IS_WINSOCKET 1
+#  define EV_SELECT_IS_WINSOCKET 0
 # endif
 # undef EV_AVOID_STDIO
 #endif
@@ -1561,13 +1561,13 @@ static EV_ATOMIC_T have_monotonic; /* did clock_gettime (CLOCK_MONOTONIC) work? 
 #endif
 
 #ifndef EV_FD_TO_WIN32_HANDLE
-# define EV_FD_TO_WIN32_HANDLE(fd) _get_osfhandle (fd)
+# define EV_FD_TO_WIN32_HANDLE(fd) (fd)
 #endif
 #ifndef EV_WIN32_HANDLE_TO_FD
-# define EV_WIN32_HANDLE_TO_FD(handle) _open_osfhandle (handle, 0)
+# define EV_WIN32_HANDLE_TO_FD(handle) (handle)
 #endif
 #ifndef EV_WIN32_CLOSE_FD
-# define EV_WIN32_CLOSE_FD(fd) close (fd)
+# define EV_WIN32_CLOSE_FD(fd) closesocket (fd)
 #endif
 
 #ifdef _WIN32
@@ -2988,7 +2988,11 @@ ev_loop_destroy (EV_P)
 #endif
 
   if (backend_fd >= 0)
+#ifdef _WIN32
+    epoll_close (backend_fd);
+#else
     close (backend_fd);
+#endif
 
 #if EV_USE_IOCP
   if (backend == EVBACKEND_IOCP  ) iocp_destroy   (EV_A);
