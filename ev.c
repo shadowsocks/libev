@@ -1567,7 +1567,11 @@ static EV_ATOMIC_T have_monotonic; /* did clock_gettime (CLOCK_MONOTONIC) work? 
 # define EV_WIN32_HANDLE_TO_FD(handle) (handle)
 #endif
 #ifndef EV_WIN32_CLOSE_FD
+#ifdef _WIN32
 # define EV_WIN32_CLOSE_FD(fd) closesocket (fd)
+#else
+# define EV_WIN32_CLOSE_FD(fd) close (fd)
+#endif
 #endif
 
 #ifdef _WIN32
