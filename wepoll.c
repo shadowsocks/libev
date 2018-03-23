@@ -33,7 +33,6 @@
 #define WEPOLL_EXPORT
 #endif
 
-#include <malloc.h>
 #include <stdint.h>
 
 /* clang-format off */
@@ -280,6 +279,8 @@ typedef struct _OBJECT_ATTRIBUTES {
 NTDLL_IMPORT_LIST(X)
 #undef X
 
+#include <stdbool.h>
+
 #include <stddef.h>
 
 #ifndef _SSIZE_T_DEFINED
@@ -315,6 +316,49 @@ typedef intptr_t ssize_t;
 #endif
 
 WEPOLL_INTERNAL void* util_safe_container_of_helper(void* ptr, size_t offset);
+
+/* NB: the tree functions do not set errno or LastError when they fail. Each of
+ * the API functions has at most one failure mode. It is up to the caller to
+ * set an appropriate error code when necessary.
+ */
+
+typedef struct tree tree_t;
+typedef struct tree_node tree_node_t;
+
+typedef struct tree {
+  tree_node_t* root;
+} tree_t;
+
+typedef struct tree_node {
+  tree_node_t* left;
+  tree_node_t* right;
+  tree_node_t* parent;
+  uintptr_t key;
+  bool red;
+} tree_node_t;
+
+WEPOLL_INTERNAL void tree_init(tree_t* tree);
+WEPOLL_INTERNAL void tree_node_init(tree_node_t* node);
+
+WEPOLL_INTERNAL int tree_add(tree_t* tree, tree_node_t* node, uintptr_t key);
+WEPOLL_INTERNAL void tree_del(tree_t* tree, tree_node_t* node);
+
+WEPOLL_INTERNAL tree_node_t* tree_find(const tree_t* tree, uintptr_t key);
+WEPOLL_INTERNAL tree_node_t* tree_root(const tree_t* tree);
+
+typedef struct proto_node {
+  tree_node_t tree_node;
+  WSAPROTOCOL_INFOW info;
+} proto_node_t;
+
+typedef struct proto_info {
+    tree_t tree;
+    proto_node_t* allocator;
+} proto_info_t;
+
+WEPOLL_INTERNAL proto_node_t* find_proto_node(proto_info_t* proto_info, DWORD catalog_id);
+WEPOLL_INTERNAL int proto_info_init(proto_info_t* proto_info);
+WEPOLL_INTERNAL int proto_info_delete(proto_info_t* proto_info);
 
 /* clang-format off */
 
@@ -366,9 +410,10 @@ WEPOLL_INTERNAL int afd_poll(SOCKET driver_socket,
                              AFD_POLL_INFO* poll_info,
                              OVERLAPPED* overlapped);
 
-WEPOLL_INTERNAL ssize_t afd_get_protocol(SOCKET socket,
-                                         SOCKET* afd_socket_out,
-                                         WSAPROTOCOL_INFOW* protocol_info);
+WEPOLL_INTERNAL int afd_get_protocol_info(proto_info_t* proto_info,
+                                          SOCKET socket,
+                                          SOCKET* afd_socket_out,
+                                          WSAPROTOCOL_INFOW* protocol_info);
 
 /* clang-format off */
 
@@ -503,10 +548,10 @@ static SOCKET _afd_get_base_socket(SOCKET socket) {
   return base_socket;
 }
 
-static ssize_t _afd_get_protocol_info(SOCKET socket,
-                                      WSAPROTOCOL_INFOW* protocol_info) {
+static int _afd_get_protocol_info(proto_info_t* proto_info,
+                                  SOCKET socket,
+                                  WSAPROTOCOL_INFOW* protocol_info) {
   int opt_len;
-  ssize_t id;
   size_t i;
 
   opt_len = sizeof *protocol_info;
@@ -523,63 +568,39 @@ static ssize_t _afd_get_protocol_info(SOCKET socket,
     DWORD catalog_id =
         protocol_info->ProtocolChain
             .ChainEntries[protocol_info->ProtocolChain.ChainLen - 1];
-    DWORD buffer_size = 0;
-    int i, r;
-    WSAPROTOCOL_INFOW* prots;
-
-    r = WSAEnumProtocolsW(NULL, NULL, &buffer_size);
-    if (r == SOCKET_ERROR && WSAGetLastError() != WSAENOBUFS)
-      return_error(-1);
-
-    prots = malloc(buffer_size);
-    if (prots == NULL)
-      return_error(-1, ERROR_NOT_ENOUGH_MEMORY);
-    memset(prots, 0, buffer_size);
-
-    r = WSAEnumProtocolsW(NULL, prots, &buffer_size);
-    if (r == SOCKET_ERROR)
-      return_error(-1);
-
-    for (i = 0; i < r; i++) {
-      WSAPROTOCOL_INFOW* p = &prots[i];
-      if (p->dwCatalogEntryId == catalog_id) {
-        *protocol_info = *p;
-      }
+    proto_node_t* proto_node = find_proto_node(proto_info, catalog_id);
+    if (proto_node != NULL &&
+        proto_node->info.dwCatalogEntryId == catalog_id) {
+      *protocol_info = proto_node->info;
     }
-
-    free(prots);
   }
 
-  id = -1;
   for (i = 0; i < array_count(AFD_PROVIDER_GUID_LIST); i++) {
     if (memcmp(&protocol_info->ProviderId,
                &AFD_PROVIDER_GUID_LIST[i],
                sizeof protocol_info->ProviderId) == 0) {
-      id = i;
-      break;
+      return 0;
     }
   }
 
-  /* Check if the protocol uses an msafd socket. */
-  if (id < 0)
-    return_error(-1, ERROR_DEVICE_FEATURE_NOT_SUPPORTED);
-
-  return id;
+  /* Socket doesn't appear to be controlled by MSAFD. */
+  return_error(-1, ERROR_DEVICE_FEATURE_NOT_SUPPORTED);
 }
 
-WEPOLL_INTERNAL ssize_t afd_get_protocol(SOCKET socket,
-                                         SOCKET* afd_socket_out,
-                                         WSAPROTOCOL_INFOW* protocol_info) {
-  ssize_t id;
+WEPOLL_INTERNAL int afd_get_protocol_info(proto_info_t* proto_info,
+                                          SOCKET socket,
+                                          SOCKET* afd_socket_out,
+                                          WSAPROTOCOL_INFOW* protocol_info) {
   SOCKET afd_socket;
+  int r;
 
   /* Try to get protocol information, assuming that the given socket is an AFD
    * socket. This should almost always be the case, and if it is, that saves us
    * a call to WSAIoctl(). */
   afd_socket = socket;
-  id = _afd_get_protocol_info(afd_socket, protocol_info);
+  r = _afd_get_protocol_info(proto_info, afd_socket, protocol_info);
 
-  if (id < 0) {
+  if (r < 0) {
     /* If getting protocol information failed, it might be due to the socket
      * not being an AFD socket. If so, attempt to fetch the underlying base
      * socket, then try again to obtain protocol information. */
@@ -591,13 +612,13 @@ WEPOLL_INTERNAL ssize_t afd_get_protocol(SOCKET socket,
     if (afd_socket == INVALID_SOCKET || afd_socket == socket)
       return_error(-1, error);
 
-    id = _afd_get_protocol_info(afd_socket, protocol_info);
-    if (id < 0)
+    r = _afd_get_protocol_info(proto_info, afd_socket, protocol_info);
+    if (r < 0)
       return -1;
   }
 
   *afd_socket_out = afd_socket;
-  return id;
+  return r;
 }
 
 #include <stdlib.h>
@@ -605,8 +626,6 @@ WEPOLL_INTERNAL ssize_t afd_get_protocol(SOCKET socket,
 WEPOLL_INTERNAL int api_global_init(void);
 
 WEPOLL_INTERNAL int init(void);
-
-#include <stdbool.h>
 
 typedef struct queue_node queue_node_t;
 
@@ -676,35 +695,6 @@ WEPOLL_INTERNAL void reflock_ref(reflock_t* reflock);
 WEPOLL_INTERNAL void reflock_unref(reflock_t* reflock);
 WEPOLL_INTERNAL void reflock_unref_and_destroy(reflock_t* reflock);
 
-/* NB: the tree functions do not set errno or LastError when they fail. Each of
- * the API functions has at most one failure mode. It is up to the caller to
- * set an appropriate error code when necessary.
- */
-
-typedef struct tree tree_t;
-typedef struct tree_node tree_node_t;
-
-typedef struct tree {
-  tree_node_t* root;
-} tree_t;
-
-typedef struct tree_node {
-  tree_node_t* left;
-  tree_node_t* right;
-  tree_node_t* parent;
-  uintptr_t key;
-  bool red;
-} tree_node_t;
-
-WEPOLL_INTERNAL void tree_init(tree_t* tree);
-WEPOLL_INTERNAL void tree_node_init(tree_node_t* node);
-
-WEPOLL_INTERNAL int tree_add(tree_t* tree, tree_node_t* node, uintptr_t key);
-WEPOLL_INTERNAL void tree_del(tree_t* tree, tree_node_t* node);
-
-WEPOLL_INTERNAL tree_node_t* tree_find(const tree_t* tree, uintptr_t key);
-WEPOLL_INTERNAL tree_node_t* tree_root(const tree_t* tree);
-
 typedef struct reflock_tree {
   tree_t tree;
   SRWLOCK lock;
@@ -759,14 +749,14 @@ typedef struct ep_sock ep_sock_t;
 
 typedef struct ep_port {
   HANDLE iocp;
-  poll_group_allocator_t*
-      poll_group_allocators[array_count(AFD_PROVIDER_GUID_LIST)];
+  poll_group_allocator_t* poll_group_allocator;
   tree_t sock_tree;
   queue_t sock_update_queue;
   queue_t sock_deleted_queue;
   reflock_tree_node_t handle_tree_node;
   CRITICAL_SECTION lock;
   size_t active_poll_count;
+  proto_info_t proto;
 } ep_port_t;
 
 WEPOLL_INTERNAL ep_port_t* ep_port_new(HANDLE* iocp_out);
@@ -784,9 +774,7 @@ WEPOLL_INTERNAL int ep_port_ctl(ep_port_t* port_info,
                                 struct epoll_event* ev);
 
 WEPOLL_INTERNAL poll_group_t* ep_port_acquire_poll_group(
-    ep_port_t* port_info,
-    size_t protocol_id,
-    const WSAPROTOCOL_INFOW* protocol_info);
+    ep_port_t* port_info, const WSAPROTOCOL_INFOW* protocol_info);
 WEPOLL_INTERNAL void ep_port_release_poll_group(ep_port_t* port_info,
                                                 poll_group_t* poll_group);
 
@@ -1034,6 +1022,7 @@ err:
   X(WSAEFAULT, EFAULT)                         \
   X(WSAEHOSTDOWN, EHOSTUNREACH)                \
   X(WSAEHOSTUNREACH, EHOSTUNREACH)             \
+  X(WSAEINPROGRESS, EBUSY)                     \
   X(WSAEINTR, EINTR)                           \
   X(WSAEINVAL, EINVAL)                         \
   X(WSAEISCONN, EISCONN)                       \
@@ -1045,9 +1034,13 @@ err:
   X(WSAENOTCONN, ENOTCONN)                     \
   X(WSAENOTSOCK, ENOTSOCK)                     \
   X(WSAEOPNOTSUPP, EOPNOTSUPP)                 \
+  X(WSAEPROCLIM, ENOMEM)                       \
   X(WSAESHUTDOWN, EPIPE)                       \
   X(WSAETIMEDOUT, ETIMEDOUT)                   \
-  X(WSAEWOULDBLOCK, EWOULDBLOCK)
+  X(WSAEWOULDBLOCK, EWOULDBLOCK)               \
+  X(WSANOTINITIALISED, ENETDOWN)               \
+  X(WSASYSNOTREADY, ENETDOWN)                  \
+  X(WSAVERNOTSUPPORTED, ENOSYS)
 
 errno_t err_map_win_error_to_errno(DWORD error) {
   switch (error) {
@@ -1082,19 +1075,10 @@ int err_check_handle(HANDLE handle) {
   return 0;
 }
 
+WEPOLL_INTERNAL int ws_global_init(void);
+
 static bool _initialized = false;
 static INIT_ONCE _once = INIT_ONCE_STATIC_INIT;
-
-static int _winsock_global_init(void) {
-  int r;
-  WSADATA wsa_data;
-
-  r = WSAStartup(MAKEWORD(2, 2), &wsa_data);
-  if (r != 0)
-    return_error(-1);
-
-  return 0;
-}
 
 static BOOL CALLBACK _init_once_callback(INIT_ONCE* once,
                                          void* parameter,
@@ -1103,7 +1087,8 @@ static BOOL CALLBACK _init_once_callback(INIT_ONCE* once,
   unused_var(parameter);
   unused_var(context);
 
-  if (_winsock_global_init() < 0 || nt_global_init() < 0 ||
+  /* N.b. that initialization order matters here. */
+  if (ws_global_init() < 0 || nt_global_init() < 0 ||
       reflock_global_init() < 0 || api_global_init() < 0)
     return FALSE;
 
@@ -1318,6 +1303,7 @@ ep_port_t* ep_port_new(HANDLE* iocp_out) {
   tree_init(&port_info->sock_tree);
   reflock_tree_node_init(&port_info->handle_tree_node);
   InitializeCriticalSection(&port_info->lock);
+  proto_info_init(&port_info->proto);
 
   *iocp_out = iocp;
   return port_info;
@@ -1351,12 +1337,9 @@ int ep_port_close(ep_port_t* port_info) {
 int ep_port_delete(ep_port_t* port_info) {
   tree_node_t* tree_node;
   queue_node_t* queue_node;
-  size_t i;
 
-  EnterCriticalSection(&port_info->lock);
-
-  if (port_info->iocp != NULL)
-    _ep_port_close_iocp(port_info);
+  /* At this point the IOCP port should have been closed. */
+  assert(port_info->iocp == NULL);
 
   while ((tree_node = tree_root(&port_info->sock_tree)) != NULL) {
     ep_sock_t* sock_info = container_of(tree_node, ep_sock_t, tree_node);
@@ -1368,15 +1351,12 @@ int ep_port_delete(ep_port_t* port_info) {
     ep_sock_force_delete(port_info, sock_info);
   }
 
-  for (i = 0; i < array_count(port_info->poll_group_allocators); i++) {
-    poll_group_allocator_t* pga = port_info->poll_group_allocators[i];
-    if (pga != NULL)
-      poll_group_allocator_delete(pga);
-  }
-
-  LeaveCriticalSection(&port_info->lock);
+  if (port_info->poll_group_allocator != NULL)
+    poll_group_allocator_delete(port_info->poll_group_allocator);
 
   DeleteCriticalSection(&port_info->lock);
+
+  proto_info_delete(&port_info->proto);
 
   _ep_port_free(port_info);
 
@@ -1624,26 +1604,19 @@ ep_sock_t* ep_port_find_socket(ep_port_t* port_info, SOCKET socket) {
 }
 
 static poll_group_allocator_t* _ep_port_get_poll_group_allocator(
-    ep_port_t* port_info,
-    size_t protocol_id,
-    const WSAPROTOCOL_INFOW* protocol_info) {
-  poll_group_allocator_t** pga;
+    ep_port_t* port_info, const WSAPROTOCOL_INFOW* protocol_info) {
+  if (port_info->poll_group_allocator == NULL) {
+    port_info->poll_group_allocator =
+        poll_group_allocator_new(port_info, protocol_info);
+  }
 
-  assert(protocol_id < array_count(port_info->poll_group_allocators));
-
-  pga = &port_info->poll_group_allocators[protocol_id];
-  if (*pga == NULL)
-    *pga = poll_group_allocator_new(port_info, protocol_info);
-
-  return *pga;
+  return port_info->poll_group_allocator;
 }
 
 poll_group_t* ep_port_acquire_poll_group(
-    ep_port_t* port_info,
-    size_t protocol_id,
-    const WSAPROTOCOL_INFOW* protocol_info) {
+    ep_port_t* port_info, const WSAPROTOCOL_INFOW* protocol_info) {
   poll_group_allocator_t* pga =
-      _ep_port_get_poll_group_allocator(port_info, protocol_id, protocol_info);
+      _ep_port_get_poll_group_allocator(port_info, protocol_info);
   return poll_group_acquire(pga);
 }
 
@@ -1679,6 +1652,73 @@ void ep_port_remove_deleted_socket(ep_port_t* port_info,
   if (!queue_enqueued(&sock_info->queue_node))
     return;
   queue_remove(&sock_info->queue_node);
+}
+
+WEPOLL_INTERNAL proto_node_t* find_proto_node(proto_info_t* proto_info, DWORD catalog_id) {
+    if (proto_info == NULL)
+      return_error(NULL);
+
+    proto_node_t* node = safe_container_of(
+      tree_find(&proto_info->tree, catalog_id), proto_node_t, tree_node);
+
+    if (node == NULL)
+        return_error(NULL, ERROR_NOT_FOUND);
+    return node;
+}
+
+WEPOLL_INTERNAL int proto_info_init(proto_info_t* proto_info) {
+  DWORD buffer_size = 0;
+  int i, r;
+  WSAPROTOCOL_INFOW* prots;
+
+  if (proto_info == NULL)
+    return_error(-1);
+
+  tree_init(&proto_info->tree);
+
+  r = WSAEnumProtocolsW(NULL, NULL, &buffer_size);
+  if (r == SOCKET_ERROR && WSAGetLastError() != WSAENOBUFS)
+    return_error(-1);
+
+  prots = malloc(buffer_size);
+  if (prots == NULL)
+    return_error(-1, ERROR_NOT_ENOUGH_MEMORY);
+  memset(prots, 0, buffer_size);
+
+  r = WSAEnumProtocolsW(NULL, prots, &buffer_size);
+  if (r == SOCKET_ERROR) {
+    free(prots);
+    return_error(-1);
+  }
+
+  proto_info->allocator = malloc(sizeof(proto_node_t) * r);
+  if (proto_info->allocator == NULL) {
+    free(prots);
+    return_error(-1, ERROR_NOT_ENOUGH_MEMORY);
+  }
+
+  for (i = 0; i < r; i++) {
+    WSAPROTOCOL_INFOW* p = &prots[i];
+    proto_node_t* proto_node = &proto_info->allocator[i];
+    proto_node->info = *p;
+    tree_node_init(&proto_node->tree_node);
+    tree_add(&proto_info->tree, &proto_node->tree_node, p->dwCatalogEntryId);
+  }
+
+  free(prots);
+  return 0;
+}
+
+WEPOLL_INTERNAL int proto_info_delete(proto_info_t* proto_info) {
+  if (proto_info == NULL)
+    return_error(-1);
+
+  if (proto_info->allocator != NULL) {
+    free(proto_info->allocator);
+    proto_info->allocator = NULL;
+    tree_init(&proto_info->tree);
+  }
+  return 0;
 }
 
 void queue_init(queue_t* queue) {
@@ -2058,7 +2098,6 @@ static int _ep_sock_cancel_poll(_ep_sock_private_t* sock_private) {
 
 ep_sock_t* ep_sock_new(ep_port_t* port_info, SOCKET socket) {
   SOCKET afd_socket;
-  ssize_t protocol_id;
   WSAPROTOCOL_INFOW protocol_info;
   poll_group_t* poll_group;
   _ep_sock_private_t* sock_private;
@@ -2066,12 +2105,10 @@ ep_sock_t* ep_sock_new(ep_port_t* port_info, SOCKET socket) {
   if (socket == 0 || socket == INVALID_SOCKET)
     return_error(NULL, ERROR_INVALID_HANDLE);
 
-  protocol_id = afd_get_protocol(socket, &afd_socket, &protocol_info);
-  if (protocol_id < 0)
+  if (afd_get_protocol_info(&port_info->proto, socket, &afd_socket, &protocol_info) < 0)
     return NULL;
 
-  poll_group =
-      ep_port_acquire_poll_group(port_info, protocol_id, &protocol_info);
+  poll_group = ep_port_acquire_poll_group(port_info, &protocol_info);
   if (poll_group == NULL)
     return NULL;
 
@@ -2531,4 +2568,15 @@ void* util_safe_container_of_helper(void* ptr, size_t offset) {
     return NULL;
   else
     return (char*) ptr - offset;
+}
+
+int ws_global_init(void) {
+  int r;
+  WSADATA wsa_data;
+
+  r = WSAStartup(MAKEWORD(2, 2), &wsa_data);
+  if (r != 0)
+    return_error(-1, r);
+
+  return 0;
 }
